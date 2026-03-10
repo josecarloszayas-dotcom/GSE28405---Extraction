@@ -1,0 +1,370 @@
+# Generate final CSV files for GSE28405 - WITH CONTROLS IN EVERY TIMEPOINT FILE (FIXED)
+# =============================================================================
+
+# 1. Working directory
+setwd("~/Desktop/invest")
+
+# 2. Load packages
+library(massiR)
+library(dplyr)
+library(GEOquery)
+library(tidyr)
+library(illuminaHumanv2.db)
+
+# 3. Load custom Y-probe list
+custom_y_probes <- readRDS("custom_y_probes.rds")
+cat("Loaded custom Y-probe list with", nrow(custom_y_probes), "probes\n")
+
+# =============================================================================
+# PART 1: Get phenotype information and identify samples
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 1: Loading phenotype data\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+# Get phenotype data from GEO
+gse <- getGEO("GSE28405", GSEMatrix = TRUE, getGPL = FALSE)[[1]]
+pheno <- pData(gse)
+
+# Extract sample type and time point
+char1 <- pheno[, "characteristics_ch1"]
+char2 <- pheno[, "characteristics_ch1.1"]
+
+sample_type <- ifelse(grepl("Control", char1), "control", "patient")
+
+time_collect <- rep("control", length(sample_type))
+patient_idx <- sample_type == "patient"
+time_collect[patient_idx] <- gsub(".*collection time: (.*)", "\\1", char2[patient_idx])
+
+# Clean time strings
+time_collect <- gsub("Less than 72 hour after symptoms", "timepoint1", time_collect)
+time_collect <- gsub("3 to 7 dys after symptoms", "timepoint2", time_collect)
+time_collect <- gsub("2 to 5 weeks after symptoms", "timepoint3", time_collect)
+
+phdata <- data.frame(
+    geo_accession = pheno$geo_accession,
+    sample_type = sample_type,
+    time_point = time_collect,
+    stringsAsFactors = FALSE
+)
+
+cat("\nSample summary:\n")
+print(table(phdata$time_point, phdata$sample_type))
+
+# =============================================================================
+# PART 2: Get sex assignments for timepoint1 patients
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 2: Getting sex assignments for timepoint1 patients\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+# Identify timepoint1 patients
+tp1_patients <- phdata$geo_accession[
+    phdata$sample_type == "patient" & 
+    phdata$time_point == "timepoint1"
+]
+cat("\nTimepoint1 patients:", length(tp1_patients), "\n")
+
+# Load timepoint1 probe data
+tp1_data <- read.csv("GSE28405_timepoint1_probes.csv", row.names = 1)
+
+# Subset to patients only
+tp1_patients_data <- tp1_data[, colnames(tp1_data) %in% tp1_patients, drop = FALSE]
+cat("Patients-only matrix:", ncol(tp1_patients_data), "samples\n")
+
+# Run massiR on timepoint1 patients only
+massi_y_out <- massi_y(tp1_patients_data, custom_y_probes)
+massi_select_out <- massi_select(tp1_patients_data, custom_y_probes, threshold = 3)
+massi_results <- massi_cluster(massi_select_out)
+
+# Extract results
+tp1_patient_sex <- massi_results[[2]]
+colnames(tp1_patient_sex) <- c("geo_accession", "mean_y", "sd_y", "zscore", "sex")
+
+cat("\nSex distribution in timepoint1 patients:\n")
+print(table(tp1_patient_sex$sex))
+cat("\n", sum(tp1_patient_sex$sex == "male"), "males,", 
+    sum(tp1_patient_sex$sex == "female"), "females\n")
+
+# =============================================================================
+# PART 3: Get sex assignments for controls
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 3: Getting sex assignments for controls\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+# Identify all controls
+all_controls <- phdata$geo_accession[phdata$sample_type == "control"]
+cat("\nTotal controls:", length(all_controls), "\n")
+
+# Extract controls from timepoint1 file
+control_data <- tp1_data[, colnames(tp1_data) %in% all_controls, drop = FALSE]
+cat("Controls found in file:", ncol(control_data), "\n")
+
+# Run massiR on controls
+massi_y_controls <- massi_y(control_data, custom_y_probes)
+massi_select_controls <- massi_select(control_data, custom_y_probes, threshold = 3)
+massi_results_controls <- massi_cluster(massi_select_controls)
+
+# Extract results
+control_sex <- massi_results_controls[[2]]
+colnames(control_sex) <- c("geo_accession", "mean_y", "sd_y", "zscore", "sex")
+
+cat("\nSex distribution in controls:\n")
+print(table(control_sex$sex))
+cat("\n", sum(control_sex$sex == "male"), "males,", 
+    sum(control_sex$sex == "female"), "females\n")
+
+# =============================================================================
+# PART 4: Create master sex file for ALL samples
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 4: Creating master sex file\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+# Initialize master sex data frame with all samples
+all_samples <- unique(phdata$geo_accession)
+master_sex <- data.frame(
+    geo_accession = all_samples,
+    sex = NA,
+    stringsAsFactors = FALSE
+)
+
+# Add control sex (direct match)
+for (i in 1:nrow(control_sex)) {
+    master_sex$sex[master_sex$geo_accession == control_sex$geo_accession[i]] <- 
+        control_sex$sex[i]
+}
+
+# Manual mapping for patients (ensures consistency across timepoints)
+tp1_list <- sort(tp1_patients)
+tp2_list <- sort(phdata$geo_accession[phdata$time_point == "timepoint2" & phdata$sample_type == "patient"])
+tp3_list <- sort(phdata$geo_accession[phdata$time_point == "timepoint3" & phdata$sample_type == "patient"])
+
+for (j in 1:length(tp1_list)) {
+    # Same patient across timepoints
+    patient_tp1 <- tp1_list[j]
+    patient_tp2 <- tp2_list[j]
+    patient_tp3 <- tp3_list[j]
+    
+    # Get sex from timepoint1
+    sex_val <- tp1_patient_sex$sex[tp1_patient_sex$geo_accession == patient_tp1]
+    
+    # Assign to all timepoints
+    master_sex$sex[master_sex$geo_accession == patient_tp1] <- sex_val
+    master_sex$sex[master_sex$geo_accession == patient_tp2] <- sex_val
+    master_sex$sex[master_sex$geo_accession == patient_tp3] <- sex_val
+}
+
+# Final check
+cat("\nFinal sex distribution across ALL samples:\n")
+print(table(master_sex$sex, useNA = "ifany"))
+
+# =============================================================================
+# PART 5: Create gene expression files for each timepoint (WITH CONTROLS) - FIXED
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 5: Creating timepoint-specific expression files WITH CONTROLS (FIXED)\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+# Download GPL file for probe to gene mapping
+cat("\nMapping probes to gene symbols...\n")
+gpl <- getGEO("GPL2700")
+gpltable <- Table(gpl)
+
+# Create probe to gene symbol mapping
+probe2acc <- gpltable[, c("ID", "GB_ACC")]
+probe2acc <- probe2acc[!is.na(probe2acc$GB_ACC) & probe2acc$GB_ACC != "", ]
+probe2acc$refseq_no_version <- gsub("\\.[0-9]+$", "", probe2acc$GB_ACC)
+
+# Map RefSeq to gene symbols
+accessions_no_version <- unique(probe2acc$refseq_no_version)
+gene_symbols <- mapIds(illuminaHumanv2.db,
+                       keys = accessions_no_version,
+                       column = "SYMBOL",
+                       keytype = "REFSEQ",
+                       multiVals = "first")
+
+acc2symbol <- data.frame(
+    refseq = names(gene_symbols),
+    symbol = as.character(gene_symbols),
+    stringsAsFactors = FALSE
+)
+acc2symbol <- acc2symbol[!is.na(acc2symbol$symbol), ]
+
+# Merge with probe2acc to get probe ID -> gene symbol
+probe2gene <- merge(probe2acc[, c("ID", "refseq_no_version")],
+                    acc2symbol,
+                    by.x = "refseq_no_version", by.y = "refseq",
+                    all.x = TRUE)
+probe2gene <- probe2gene[!is.na(probe2gene$symbol), c("ID", "symbol")]
+
+# Function to create timepoint expression file with gene symbols (WITH CONTROLS) - FIXED
+create_timepoint_expr_file <- function(timepoint, output_file) {
+    
+    cat("\nProcessing", timepoint, "...\n")
+    
+    # Get patient samples for this timepoint
+    patient_samples <- phdata$geo_accession[
+        phdata$time_point == timepoint & 
+        phdata$sample_type == "patient"
+    ]
+    
+    # Get all controls
+    control_samples <- all_controls
+    
+    # Combine - we want 31 patients + 26 controls = 57 samples
+    tp_samples <- c(patient_samples, control_samples)
+    
+    cat("  Total samples:", length(tp_samples), "\n")
+    cat("  - Patients:", length(patient_samples), "\n")
+    cat("  - Controls:", length(control_samples), "\n")
+    
+    # Load probe-level data for this timepoint
+    probe_file <- paste0("GSE28405_", timepoint, "_probes.csv")
+    if (!file.exists(probe_file)) {
+        cat("  Warning:", probe_file, "not found, skipping\n")
+        return(NULL)
+    }
+    
+    tp_probe_data <- read.csv(probe_file, row.names = 1)
+    
+    # Get patient data from current timepoint
+    patient_data <- tp_probe_data[, colnames(tp_probe_data) %in% patient_samples, drop = FALSE]
+    
+    # For controls, we need to get their expression data from timepoint1 file
+    # Since controls are the same across all timepoints, we use timepoint1 data for controls
+    tp1_data <- read.csv("GSE28405_timepoint1_probes.csv", row.names = 1)
+    control_data <- tp1_data[, colnames(tp1_data) %in% control_samples, drop = FALSE]
+    
+    # Combine patient data (from current timepoint) with control data (from timepoint1)
+    # IMPORTANT: Make sure column names are unique - they should be since patient and control IDs don't overlap
+    combined_data <- cbind(patient_data, control_data)
+    
+    cat("  Combined matrix:", nrow(combined_data), "probes,", ncol(combined_data), "samples\n")
+    
+    # Verify we have the right number of samples
+    if (ncol(combined_data) != 57) {
+        cat("  ⚠️ Warning: Expected 57 samples, got", ncol(combined_data), "\n")
+    }
+    
+    # Convert probe IDs to gene symbols
+    combined_df <- as.data.frame(combined_data)
+    combined_df$ID <- rownames(combined_df)
+    
+    # Merge with gene symbols
+    gene_data <- merge(probe2gene, combined_df, by = "ID")
+    gene_data <- gene_data[, -1]  # drop ID column
+    
+    # Aggregate multiple probes per gene (using median)
+    gene_agg <- aggregate(. ~ symbol, data = gene_data, FUN = median)
+    
+    # Replace hyphens in gene symbols for safe column names
+    gene_agg$symbol <- gsub("-", "_", gene_agg$symbol)
+    
+    # Transpose: samples as rows, genes as columns
+    expr_matrix <- as.data.frame(t(gene_agg[, -1]))
+    colnames(expr_matrix) <- gene_agg$symbol
+    expr_matrix$geo_accession <- colnames(gene_agg)[-1]
+    
+    # Reorder to have geo_accession first
+    expr_matrix <- expr_matrix[, c("geo_accession", gene_agg$symbol)]
+    
+    # Add sex information from master file
+    expr_with_sex <- merge(expr_matrix, master_sex, by = "geo_accession", all.x = TRUE)
+    
+    # Check for NAs in sex
+    if (any(is.na(expr_with_sex$sex))) {
+        cat("  ⚠️ Warning:", sum(is.na(expr_with_sex$sex)), "samples have NA sex\n")
+    }
+    
+    # Reorder columns to put sex after geo_accession
+    expr_final <- expr_with_sex[, c("geo_accession", "sex", 
+                                     setdiff(names(expr_with_sex), 
+                                            c("geo_accession", "sex")))]
+    
+    # Sort by geo_accession for consistency
+    expr_final <- expr_final[order(expr_final$geo_accession), ]
+    
+    # Save
+    write.csv(expr_final, output_file, row.names = FALSE)
+    cat("  Saved to:", output_file, "\n")
+    cat("  Dimensions:", nrow(expr_final), "samples,", ncol(expr_final), "columns\n")
+    
+    # Quick sex check
+    cat("  Sex distribution in this file:\n")
+    print(table(expr_final$sex, useNA = "ifany"))
+    
+    return(expr_final[, c("geo_accession", "sex")])
+}
+
+# Create files for each timepoint and collect sex data
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("Creating expression files with controls (FIXED)...\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+sex_data_list <- list()
+
+sex_data_list[["timepoint1"]] <- create_timepoint_expr_file("timepoint1", "GSE28405_timepoint1_expr_with_controls.csv")
+sex_data_list[["timepoint2"]] <- create_timepoint_expr_file("timepoint2", "GSE28405_timepoint2_expr_with_controls.csv")
+sex_data_list[["timepoint3"]] <- create_timepoint_expr_file("timepoint3", "GSE28405_timepoint3_expr_with_controls.csv")
+
+# =============================================================================
+# PART 6: Create separate sex CSV files for each timepoint
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("PART 6: Creating separate sex CSV files for each timepoint\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+for (tp in names(sex_data_list)) {
+    if (!is.null(sex_data_list[[tp]])) {
+        # Create sex-only file
+        sex_file <- paste0("GSE28405_", tp, "_sex.csv")
+        write.csv(sex_data_list[[tp]], sex_file, row.names = FALSE)
+        cat("\nCreated:", sex_file)
+        cat("\n  Samples:", nrow(sex_data_list[[tp]]))
+        cat("\n  Sex distribution:\n")
+        print(table(sex_data_list[[tp]]$sex))
+    }
+}
+
+# =============================================================================
+# PART 7: Summary
+# =============================================================================
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("FINAL SUMMARY\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
+cat("\nSex distribution by sample type:\n")
+sex_by_type <- merge(master_sex, phdata, by = "geo_accession")
+print(table(sex_by_type$sample_type, sex_by_type$sex))
+
+cat("\nSex distribution by timepoint (with controls):\n")
+for (tp in c("timepoint1", "timepoint2", "timepoint3")) {
+    if (!is.null(sex_data_list[[tp]])) {
+        cat("\n", tp, ":\n")
+        print(table(sex_data_list[[tp]]$sex))
+    }
+}
+
+cat("\n", paste(rep("=", 60), collapse=""), "\n")
+cat("DONE! Files created:\n")
+cat("\nEXPRESSION FILES (57 samples each - 26 controls + 31 patients):\n")
+cat("  1. GSE28405_timepoint1_expr_with_controls.csv\n")
+cat("  2. GSE28405_timepoint2_expr_with_controls.csv\n")
+cat("  3. GSE28405_timepoint3_expr_with_controls.csv\n")
+cat("\nSEX FILES (matching each expression file):\n")
+cat("  4. GSE28405_timepoint1_sex.csv\n")
+cat("  5. GSE28405_timepoint2_sex.csv\n")
+cat("  6. GSE28405_timepoint3_sex.csv\n")
+cat("\nMASTER SEX FILE (all samples):\n")
+cat("  7. GSE28405_sex.csv\n")
+cat(paste(rep("=", 60), collapse=""), "\n")
+
